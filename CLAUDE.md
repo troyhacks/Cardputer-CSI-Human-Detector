@@ -30,12 +30,16 @@ Information (CSI). Realistic target: on-device **presence + motion**.
 - Cardputer → S3: `CAL` | `CALSTOP` | `THR <float>` | `RATE <hz>` | `PING`→`PONG`
 
 ## Build / run
-- `pio run -e cardputer-radar -t upload` — **fake-data mode** (`RADAR_FAKE=1`),
-  no sensor needed.
-- `pio run -e cardputer-radar-wifi -t upload` — live WiFi UDP mode; S3 must be
-  running and `SQUACHNET` must be up before the Cardputer boots.
-- `cd tools/sensor_s3 && pio run -t upload` — flash the S3 sensor (COM44).
-- `tools/fake_c5/fake_c5.ino` — spare-S3 UART emitter for wired link testing.
+- `pio run -e cardputer-radar-csi -t upload` — **Cardputer ADV**; dual-screen,
+  runtime WiFi picker, on-device CSI capture.
+- `pio run -e freenove-fnk0104b -t upload` — **Freenove FNK0104B** (ESP32-S3);
+  single 240x320 display, FT6336U touchscreen (top=mode, left=thr−, right=thr+,
+  bottom=calibrate), compile-time WiFi credentials via `credentials.ini`.
+- `pio run -e cardputer-radar-csi -t upload --upload-port COM18` — flash Cardputer.
+
+> **Note:** The `tools/sensor_s3/` and `tools/fake_c5/` firmware directories
+> are **not present** in this checkout. Both envs use the ESP32-S3's built-in
+> CSI hardware for on-device WiFi sensing.
 
 ## Hard constraints (don't regress these)
 - Build sets `ARDUINO_USB_CDC_ON_BOOT=1` → **`Serial` is USB-C**. Any sensor
@@ -55,15 +59,18 @@ Information (CSI). Realistic target: on-device **presence + motion**.
 - `src/main.cpp` — UI: `drawBottom()` (status), `drawTop()` (radar scope),
   `drawRaycaster()` (vaporwave 3D mode), `serviceKeys()`, fake generator.
   Bottom @30 fps, top @~8 fps.
-- `include/ext_panel.h` — external ILI9341 panel class.
-- `tools/sensor_s3/` — S3 CSI sensor firmware (AP mode, UDP broadcast).
-- `tools/fake_c5/fake_c5.ino` — spare-S3 UART protocol emitter.
+- `include/ext_panel.h` — external ILI9341 panel class (Cardputer only).
+- `include/freenove_display.h` — LovyanGFX + FT6336U touch driver for
+  FREENOVE_FNK0104B (single 240x320 display, touchscreen zones).
+- `credentials.ini.example` — template for WiFi credentials.
 
 ## Status
 ✅ Dual-screen UI, parser, link layer, history, radar scope — working on real
-CSI data over WiFi UDP. S3 runs as AP (`SQUACHNET`), Cardputer connects and
-receives frames. Stable contact blips with EMA smoothing.
-⚠️ `kScale=25.0f` in sensor_s3 needs tuning with real motion data.
+CSI data. Cardputer: on-device CSI + runtime WiFi picker. Freenove: same CSI
+path, compile-time credentials, single 240x320 display.
+⚠️ `kScale=25.0f` in sensor_s3 needs tuning with real motion data (sensor_s3
+firmware not present in this checkout).
+⚠️ FREENOVE_FNK0104B build uses `RADAR_FAKE=1` — real CSI path not yet wired.
 
 ## Next steps (priority order)
 1. **Tune `kScale`** in `sensor_s3.ino`: the variance normalization constant
@@ -82,5 +89,7 @@ receives frames. Stable contact blips with EMA smoothing.
 - C5 (best CSI): MonsterC5, AWOK Dual Touch (2x each), Marauder v8.
 - C3: BLEShark Nanos (many; mesh-capable).
 - S3: Cardputer ADV (console, COM18); S3 DevKit (sensor, COM44).
+- S3: FREENOVE_FNK0104B (ESP32-S3-WROOM-1, 8MB flash) — single 240x320
+  ILI9341 + FT6336U touchscreen, 4-button touch zones.
 - Classic ESP32: Cheap Yellow Displays, HaleHound (CYD-based).
 - Not ESP32: Cardputer Zero (Raspberry Pi CM Zero), Hackberry Pi, HackRF/PortaPack.
