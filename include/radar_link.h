@@ -30,14 +30,14 @@ public:
   static constexpr int kLineMax = 96;   // max inbound line length (bytes)
 
   struct State {
-    uint32_t seq      = 0;        // last sequence number from the C5
+    uint32_t seq = 0;        // last sequence number from the C5
     bool     presence = false;    // someone detected?
-    float    motion   = 0.0f;     // normalized activity 0..1
-    int      rssi     = 0;        // dBm of the link being sensed
-    char     mode[8]  = "INIT";   // CAL / RUN / IDLE ...
+    float    motion = 0.0f;     // normalized activity 0..1
+    int      rssi = 0;        // dBm of the link being sensed
+    char     mode[8] = "INIT";   // CAL / RUN / IDLE ...
     uint32_t lastRxMs = 0;        // millis() of last good frame
-    uint32_t frames   = 0;        // good frames parsed
-    uint32_t dropped  = 0;        // frames missed (detected via seq gaps)
+    uint32_t frames = 0;        // good frames parsed
+    uint32_t dropped = 0;        // frames missed (detected via seq gaps)
     uint32_t parseErr = 0;        // malformed lines / overruns
   };
 
@@ -46,7 +46,7 @@ public:
   void begin(HardwareSerial& uart, int rxPin, int txPin, uint32_t baud = 115200) {
     _uart = &uart;
     _uart->begin(baud, SERIAL_8N1, rxPin, txPin);
-    _len  = 0;
+    _len = 0;
     _head = 0;
     for (int i = 0; i < kHistory; ++i) _hist[i] = 0.0f;
   }
@@ -82,11 +82,11 @@ public:
   static constexpr int historySize() { return kHistory; }
 
   // ---- commands to the C5 ----------------------------------------------------
-  void calibrate()           { send("CAL"); }
-  void stopCalibrate()       { send("CALSTOP"); }
+  void calibrate() { send("CAL"); }
+  void stopCalibrate() { send("CALSTOP"); }
   void setThreshold(float t) { char b[24]; snprintf(b, sizeof(b), "THR %.2f", t); send(b); }
-  void setRate(int hz)       { char b[16]; snprintf(b, sizeof(b), "RATE %d", hz); send(b); }
-  void ping()                { send("PING"); }
+  void setRate(int hz) { char b[16]; snprintf(b, sizeof(b), "RATE %d", hz); send(b); }
+  void ping() { send("PING"); }
 
   // ---- optional test hook: inject a synthetic frame (no C5 needed) -----------
   // Lets you bring up the UI before the sensor exists: feed it "R,..." strings.
@@ -119,9 +119,9 @@ private:
     }
     if (n < 6) { _state.parseErr++; return false; }
 
-    uint32_t seq  = strtoul(tok[1], nullptr, 10);
+    uint32_t seq = strtoul(tok[1], nullptr, 10);
     int      pres = atoi(tok[2]);
-    float    mot  = atof(tok[3]);
+    float    mot = atof(tok[3]);
     int      rssi = atoi(tok[4]);
     if (mot < 0.0f) mot = 0.0f;
     if (mot > 1.0f) mot = 1.0f;
@@ -129,10 +129,10 @@ private:
     if (_state.frames > 0 && seq > _state.seq + 1)
       _state.dropped += (seq - _state.seq - 1);
 
-    _state.seq      = seq;
+    _state.seq = seq;
     _state.presence = (pres != 0);
-    _state.motion   = mot;
-    _state.rssi     = rssi;
+    _state.motion = mot;
+    _state.rssi = rssi;
     strncpy(_state.mode, tok[5], sizeof(_state.mode) - 1);
     _state.mode[sizeof(_state.mode) - 1] = '\0';
     _state.lastRxMs = millis();
@@ -145,7 +145,7 @@ private:
 
   HardwareSerial* _uart = nullptr;
   char  _line[kLineMax];
-  int   _len  = 0;
+  int   _len = 0;
   State _state;
   float _hist[kHistory] = {};           // zero-init: safe without begin()
   int   _head = 0;

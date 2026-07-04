@@ -5,3 +5,4 @@
 .vscode/ipch
 .claude/settings.local.json
 credentials.ini
+wifi_creds.h
