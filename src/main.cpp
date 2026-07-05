@@ -447,7 +447,8 @@ static void enableCsi() {
 
   // 5. Set filter to receive all packet types that carry CSI
   wifi_promiscuous_filter_t pf {};
-  pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL;
+  // pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
   err = esp_wifi_set_promiscuous_filter(&pf);
   Serial.printf("# esp_wifi_set_promiscuous_filter: %s\n", esp_err_to_name(err));
 }
