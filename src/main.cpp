@@ -16,6 +16,7 @@
 // =============================================================================
 
 #include <math.h>
+#include <esp_heap_caps.h>
 
 // ── Freenove FNK0104B ────────────────────────────────────────────────────────
 #if defined(FREENOVE_FNK0104B)
@@ -23,6 +24,9 @@
 #include <driver/ledc.h>
 #include <driver/timer.h>
 #include "esp_wifi.h"
+#include "esp_wifi_types.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
 #include "wifi_creds.h"  // WIFI_SSID / WIFI_PASS / WIFI_CHANNEL
 #include "radar_link.h"
 #include "freenove_display.h"
@@ -30,6 +34,10 @@
 static FreenoveDisplay        display;
 static lgfx::v1::LGFX_Sprite canvas(&display);
 static bool                  displayReady = false;
+static char                  gIpStr[16] = "no-ip";   // local STA IP, set by wifi event
+static esp_netif_t* sta_netif = NULL;
+static esp_netif_t* ap_netif = NULL;
+static esp_netif_t* eth_netif = NULL;
 
 // ── Cardputer ADV ─────────────────────────────────────────────────────────────
 #else
@@ -50,7 +58,7 @@ static RadarLink        radar;
 // Shared CSI state
 static bool     wifiReady = true;
 
-static float           gThreshold = 0.35f;
+static float           gThreshold = 0.0f;   // 0% = EMA noise floor; >0% = manual threshold culling
 #if !defined(FREENOVE_FNK0104B)
 static const float     EXT_ZOOM = 320.0f / 240.0f;   // 240x180 * 1.333 = 320x240
 #endif
@@ -74,9 +82,9 @@ static uint16_t gColB = 0;
 static bool     gMenuOpen = false;
 static uint8_t  gMenuCursor = 0;
 
-enum class VizMode : uint8_t { SCOPE = 0, DEVICE_LIST = 1 };
-static constexpr uint8_t kVizModeCount = 2;
-static VizMode gVizMode = VizMode::DEVICE_LIST;  // default to device list
+enum class VizMode : uint8_t { SCOPE = 0, DEVICE_LIST = 1, FFT_LINES = 2 };
+static constexpr uint8_t kVizModeCount = 3;
+static VizMode gVizMode = VizMode::FFT_LINES;  // default to FFT lines
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
@@ -128,7 +136,54 @@ static const uint32_t kCalDurationMs = 10000;   // 10 s empty-room training
 
 static void IRAM_ATTR promiscuousRxCb(void*, wifi_promiscuous_pkt_type_t) {}
 
+// ── Doppler FFT analysis ────────────────────────────────────────────────────
+// 128-point FFT at 15 Hz sampling → 0.117 Hz/bin, Nyquist = 7.5 Hz
+// Human motion: 0.9–7.4 Hz (bins 8–63). Fan detection requires >120 Hz sampling.
+// dl_fft: SIMD-optimized on S3 via aes3.S
+// #define FFT_DEBUG  // set to enable serial debug output
+#include "dl_fft.h"
+static const int  kDopplerFrames = 64;        // 64 frames @ 15 Hz ≈ 4.3 s window
+static const int  kDopplerFFTSize = 64;        // must be power of 2
+static const float kDopplerHzPerBin = 15.0f / (float)kDopplerFFTSize;  // ≈ 0.234 Hz/bin
+static const int  kDopplerHzBinLo = 4;        // ~0.9 Hz — above slow drift, clear of bin 5 noise
+static const int  kDopplerHzBinHi = 31;        // ~7.3 Hz — Nyquist (7.5 Hz)
 
+enum class DopplerClass { STATIC, HUMAN };
+
+// Forward declaration (DeviceEntry defined later in this file)
+struct DeviceEntry;
+
+// Shared FFT engine and working buffer (one FFT at a time, all MACs share)
+static dl_fft_f32_t* gDopplerHandle = nullptr;
+static float* gDopplerFftWork;  // 256-float complex working buffer (PSRAM)
+static float  gDopplerWin[kDopplerFrames];     // Hann window (not PSRAM — small)
+
+// Allocate per-device PSRAM Doppler buffers for all device slots
+static void initDoppler() {
+    gDopplerFftWork = (float*)heap_caps_malloc(kDopplerFFTSize * 2 * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!gDopplerFftWork) {
+        #ifdef FFT_DEBUG
+        Serial.println("# Doppler: PSRAM alloc failed!");
+        #endif
+        return;
+    }
+    // Pre-compute Hann window
+    for (int i = 0; i < kDopplerFFTSize; i++) {
+        gDopplerWin[i] = 0.5f * (1.0f - cosf(2.0f * PI * i / (kDopplerFFTSize - 1)));
+    }
+    // Init dl_fft (SIMD-optimized on S3 via aes3.S)
+    gDopplerHandle = dl_fft_f32_init(kDopplerFFTSize, MALLOC_CAP_SPIRAM);
+    if (!gDopplerHandle) {
+        #ifdef FFT_DEBUG
+        Serial.println("# Doppler: dl_fft_f32_init failed!");
+        #endif
+        return;
+    }
+    #ifdef FFT_DEBUG
+    Serial.printf("# Doppler: dl_fft OK, %d-point (%.1f Hz/bin)\n",
+                  kDopplerFFTSize, kDopplerHzPerBin);
+    #endif
+}
 // ── Per-MAC device table ─────────────────────────────────────────────────────
 static constexpr int kMaxDevices = 16;
 struct DeviceEntry {
@@ -146,11 +201,103 @@ struct DeviceEntry {
   bool     hidden = false;   // hidden if low for too long
   bool     visible = false;  // not shown until good for 10 s
   bool     valid = false;
+  // Per-MAC Doppler FFT state (PSRAM buffers allocated lazily)
+  float*   dopplerBuf = nullptr;   // 128-float circular time-domain buffer
+  float*   dopplerFft = nullptr;   // 256-float complex FFT buffer
+  int      dopplerIdx = 0;         // circular write index
+  int      dopplerFilled = 0;      // samples accumulated
+  float    dopplerHpState = 0.0f; // HP filter state
+  float    dopplerHz = 0.0f;      // dominant frequency
+  int      dopplerPeakBin = 0;    // bin of dominant frequency
+  float    dopplerNoiseFloor[32] = {0};  // EMA noise floor per bin (dB magnitude)
+  float    noiseFloorAlpha = 0.02f;      // EMA adaptation rate (2% per frame)
+  DopplerClass dopplerClass = DopplerClass::STATIC;
 };
 static DeviceEntry  gDevices[kMaxDevices];
+
+// Run per-device FFT: process device[i]'s Doppler buffer if full
+static bool gDeviceListDirty = false;  // defined here so runDopplerFFTForDevice can set it
+static void runDopplerFFTForDevice(int i) {
+    DeviceEntry& d = gDevices[i];
+    if (!d.dopplerBuf || !d.dopplerFft || !gDopplerHandle) return;
+    if (d.dopplerFilled < kDopplerFrames) return;
+
+    // Copy HP-filtered time-domain buffer to complex FFT input, apply Hann window
+    for (int j = 0; j < kDopplerFFTSize; j++) {
+        gDopplerFftWork[j * 2]     = d.dopplerBuf[j] * gDopplerWin[j]; // real × Hann
+        gDopplerFftWork[j * 2 + 1] = 0.0f;                             // imag = 0
+    }
+
+    // Run FFT (SIMD on S3 — dl_fft handles bit-reverse internally)
+    dl_fft_f32_run(gDopplerHandle, gDopplerFftWork);
+
+    // Copy FFT result to device's buffer so the bar graph can read it later
+    for (int j = 0; j < kDopplerFFTSize; j++) {
+        d.dopplerFft[j * 2]     = gDopplerFftWork[j * 2];
+        d.dopplerFft[j * 2 + 1] = gDopplerFftWork[j * 2 + 1];
+    }
+
+    // Per-bin magnitudes for this frame
+    float mag32[32] = {0};
+    for (int j = 1; j < kDopplerFFTSize / 2; j++) {
+        float re = d.dopplerFft[j * 2];
+        float im = d.dopplerFft[j * 2 + 1];
+        mag32[j] = sqrtf(re * re + im * im);  // magnitude
+        // Update EMA noise floor every frame (slow adaptation)
+        d.dopplerNoiseFloor[j] = d.dopplerNoiseFloor[j] * (1.0f - d.noiseFloorAlpha)
+                                 + mag32[j] * d.noiseFloorAlpha;
+    }
+
+    // Determine minMag threshold
+    float peakRaw = 0.0f;
+    for (int j = kDopplerHzBinLo; j <= kDopplerHzBinHi; j++) {
+        if (mag32[j] > peakRaw) peakRaw = mag32[j];
+    }
+    // Manual threshold: fraction of peak. EMA threshold (0%): subtract noise floor, floor at 0
+    float minMag = 0.0f;
+    if (gThreshold > 0.0f && peakRaw > 0.0f) {
+        minMag = gThreshold * peakRaw;  // manual fraction-of-peak culling
+    }
+
+    // Classify: peak must be meaningfully above human-band average
+    int peakBin = 0;
+    float peakSig = 0.0f;
+    float bandSig = 0.0f;
+    int bandCount = 0;
+    for (int j = kDopplerHzBinLo; j <= kDopplerHzBinHi; j++) {
+        float sig = mag32[j];
+        if (gThreshold == 0.0f) {
+            sig = mag32[j] - d.dopplerNoiseFloor[j];  // EMA noise subtraction
+            if (sig < 0.0f) sig = 0.0f;
+        } else if (sig < minMag) {
+            sig = 0.0f;
+        }
+        if (sig > peakSig) { peakSig = sig; peakBin = j; }
+        bandSig += sig;
+        if (sig > 0.0f) bandCount++;
+    }
+
+    d.dopplerHz = peakBin * kDopplerHzPerBin;
+    d.dopplerPeakBin = peakBin;
+
+    float avgSig = bandCount > 0 ? bandSig / bandCount : 0.0f;
+    if (peakBin == 0 || peakSig < avgSig * 2.0f) {
+        d.dopplerClass = DopplerClass::STATIC;
+    } else {
+        d.dopplerClass = DopplerClass::HUMAN;
+    }
+    gDeviceListDirty = true;  // force redraw so HUMAN/STATIC updates immediately
+    #ifdef FFT_DEBUG
+    Serial.printf("# Doppler[%d] %02x:%02x:%02x:%02x:%02x:%02x  %.1f Hz  %s\n",
+        i,
+        d.mac[0], d.mac[1], d.mac[2], d.mac[3], d.mac[4], d.mac[5],
+        d.dopplerHz,
+        d.dopplerClass == DopplerClass::HUMAN ? "HUMAN" : "STATIC");
+    #endif
+}
+
 static DeviceEntry  _sorted[kMaxDevices];   // stable sort order
 static int          _sortedCount = 0;
-static bool          gDeviceListDirty = false;
 static constexpr uint8_t kHideAfterLowPpsSecs = 10;  // seconds before hiding
 static constexpr uint8_t kHideAfterLowRssiSecs = 10;
 
@@ -234,20 +381,36 @@ static void IRAM_ATTR csiCallback(void*, wifi_csi_info_t* info) {
     isNew = true;
   }
   if (slot >= 0) {
+    DeviceEntry& dev = gDevices[slot];
     if (isNew) {
-      gDevices[slot].goodSecs = 0;
-      gDevices[slot].visible = false;
-      gDevices[slot].hidden = false;
+      dev.goodSecs = 0;
+      dev.visible = false;
+      dev.hidden = false;
+      dev.dopplerIdx = 0;
+      dev.dopplerFilled = 0;
+      dev.dopplerHz = 0.0f;
+      dev.dopplerClass = DopplerClass::STATIC;
+      dev.dopplerHpState = 0.0f;
+      // Lazy PSRAM allocation for this device's Doppler buffers
+      dev.dopplerBuf = (float*)heap_caps_malloc(kDopplerFrames * sizeof(float), MALLOC_CAP_SPIRAM);
+      dev.dopplerFft = (float*)heap_caps_malloc(kDopplerFrames * 2 * sizeof(float), MALLOC_CAP_SPIRAM);
     }
-    memcpy(gDevices[slot].mac, mac, 6);
-    gDevices[slot].rssi = rssi;
-    gDevices[slot].noise = noise;
-    gDevices[slot].channel = info->rx_ctrl.channel;
-    gDevices[slot].motion = gCsiMotion;
-    gDevices[slot].lastSeen = now;
-    gDevices[slot].pktCount++;
-    gDevices[slot].valid = true;
-    gDeviceListDirty = true;
+    // Feed Doppler: HP filter then circular buffer
+    if (dev.dopplerBuf) {
+      dev.dopplerHpState = dev.dopplerHpState * 0.95f + meanAmp * 0.05f;
+      float hpAmp = meanAmp - dev.dopplerHpState;
+      dev.dopplerBuf[dev.dopplerIdx] = hpAmp;
+      dev.dopplerIdx = (dev.dopplerIdx + 1) % kDopplerFrames;
+      if (dev.dopplerFilled < kDopplerFrames) dev.dopplerFilled++;
+    }
+    memcpy(dev.mac, mac, 6);
+    dev.rssi = rssi;
+    dev.noise = noise;
+    dev.channel = info->rx_ctrl.channel;
+    dev.motion = gCsiMotion;
+    dev.lastSeen = now;
+    dev.pktCount++;
+    dev.valid = true;
   }
 }
 
@@ -257,18 +420,36 @@ static void enableCsi() {
   gCsiPhaVarMax = 0.001f; gCsiPhaVarMin = 0.0f;
   memset(gCsiAmpBuf, 0, sizeof(gCsiAmpBuf));
   memset(gCsiPhaBuf, 0, sizeof(gCsiPhaBuf));
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(promiscuousRxCb);
+
+  // 1. Enable promiscuous mode first
+  esp_err_t err = esp_wifi_set_promiscuous(true);
+  Serial.printf("# esp_wifi_set_promiscuous(true): %s\n", esp_err_to_name(err));
+
+  // 2. Register CSI callback BEFORE enabling CSI
+  err = esp_wifi_set_csi_rx_cb(csiCallback, nullptr);
+  Serial.printf("# esp_wifi_set_csi_rx_cb: %s\n", esp_err_to_name(err));
+
+  // 3. Configure CSI — disable channel_filter to avoid smoothing adjacent sub-carriers
   wifi_csi_config_t cfg = {};
-  cfg.lltf_en = true; cfg.htltf_en = true; cfg.stbc_htltf2_en = true;
-  cfg.ltf_merge_en = true; cfg.channel_filter_en = true;
-  cfg.manu_scale = false; cfg.shift = 0;
-  esp_wifi_set_csi_config(&cfg);
-  esp_wifi_set_csi_rx_cb(csiCallback, nullptr);
-  esp_wifi_set_csi(true);
+  cfg.lltf_en = true;
+  cfg.htltf_en = true;
+  cfg.stbc_htltf2_en = true;
+  cfg.ltf_merge_en = true;
+  cfg.channel_filter_en = false;   // disable: keeps sub-carriers independent
+  cfg.manu_scale = false;
+  cfg.shift = 0;
+  err = esp_wifi_set_csi_config(&cfg);
+  Serial.printf("# esp_wifi_set_csi_config: %s\n", esp_err_to_name(err));
+
+  // 4. Enable CSI
+  err = esp_wifi_set_csi(true);
+  Serial.printf("# esp_wifi_set_csi(true): %s\n", esp_err_to_name(err));
+
+  // 5. Set filter to receive all packet types that carry CSI
   wifi_promiscuous_filter_t pf {};
   pf.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
-  esp_wifi_set_promiscuous_filter(&pf);
+  err = esp_wifi_set_promiscuous_filter(&pf);
+  Serial.printf("# esp_wifi_set_promiscuous_filter: %s\n", esp_err_to_name(err));
 }
 
 // ── Calibration trigger (local, no UART peer needed) ─────────────────────────
@@ -283,23 +464,108 @@ static void startCalibration() {
   radar.calibrate();   // also send to UART peer if one exists
 }
 
-// ── CSI init (no WiFi connection needed) ───────────────────────────────────
+// ── CSI init ─────────────────────────────────────────────────────────────────
 #if defined(FREENOVE_FNK0104B)
+// static void wifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+//   if (event_id == IP_EVENT_STA_GOT_IP) {
+//     auto* ev = (ip_event_got_ip_t*)event_data;
+//     snprintf(gIpStr, sizeof(gIpStr), "%d.%d.%d.%d", IP2STR(&ev->ip_info.ip));
+//     Serial.printf("# STA IP: %s\n", gIpStr);
+//     initDoppler();
+//     enableCsi();
+//     wifiReady = true;
+//   } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+//     Serial.printf("# WiFi disconnected\n");
+//   }
+// }
+
+static void wifi_event_handler(void* event_handler_arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+
+  static uint8_t s_retry_num = 0;
+
+  if (event_base == WIFI_EVENT) {
+
+    if (event_id == WIFI_EVENT_STA_START) {
+      Serial.println("Event: WiFi Started");
+      ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+      Serial.println("Event: WiFi Connected");
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+      wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*)event_data;
+      Serial.printf("Disconnected from %s, reason: %d\n", event->ssid, event->reason);
+      Serial.println("Event: WiFi Lost Connection");
+      if (s_retry_num < 5) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        s_retry_num++;
+        Serial.printf("Event Action: Retry to connect to the AP %d\n", s_retry_num);
+      }
+    } else if (event_id == WIFI_EVENT_STA_STOP) {
+      Serial.println("Event: WiFi Stopped");
+    } else if (event_id == WIFI_EVENT_AP_START) {
+      Serial.println("Event: SoftAP Started");
+      ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    } else if (event_id == WIFI_EVENT_AP_STOP) {
+      Serial.println("Event: SoftAP Stopped");
+    } else if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+      Serial.println("Event: AP Client Connected");
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+      Serial.println("Event: AP Client Disconnected");
+    } else {
+      Serial.printf("Event: WiFi threw unidentified code %d\n", event_id);
+    }
+
+  } else if (event_base == IP_EVENT) {
+
+    if (event_id == IP_EVENT_STA_GOT_IP) {
+      Serial.println("Event: WiFi Got IP");
+      ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+      snprintf(gIpStr, sizeof(gIpStr), "%d.%d.%d.%d", IP2STR(&event->ip_info.ip));
+      Serial.printf("# STA IP: %s\n", gIpStr);
+      s_retry_num = 0;
+      delay(100);
+      initDoppler();
+      delay(100);
+      enableCsi();
+      delay(100);
+      wifiReady = true;
+    }
+
+  }
+}
+
 static void initCsi() {
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  return;
+  // Event loop
+  // esp_err_t err = esp_event_loop_create_default();
+  // if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err);
 
-  wifi_config_t sta_cfg = {};
-  strncpy((char*)sta_cfg.sta.ssid, WIFI_SSID, sizeof(sta_cfg.sta.ssid));
-  strncpy((char*)sta_cfg.sta.password, WIFI_PASS, sizeof(sta_cfg.sta.password));
-  // sta_cfg.sta.channel = WIFI_CHANNEL;
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-  ESP_ERROR_CHECK(esp_wifi_start());
+  // // Register handler BEFORE starting WiFi so we catch the GOT_IP event
+  // ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifiEventHandler, nullptr));
+  // ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifiEventHandler, nullptr));
 
-  wifiReady = true;
-  enableCsi();
-  Serial.printf("# CSI active (STA %s ch %d)\n", WIFI_SSID, sta_cfg.sta.channel);
+  // // WiFi init
+  // wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  // ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  // ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+  // wifi_config_t sta_cfg = {};
+  // strncpy((char*)sta_cfg.sta.ssid, WIFI_SSID, sizeof(sta_cfg.sta.ssid));
+  // strncpy((char*)sta_cfg.sta.password, WIFI_PASS, sizeof(sta_cfg.sta.password));
+  // ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+  // ESP_ERROR_CHECK(esp_wifi_start());
+  // ESP_ERROR_CHECK(esp_wifi_connect());
+
+  // Pump the event loop until we have an IP (~1-3 sec typical)
+  // Serial.printf("# Waiting for IP");
+  // uint32_t start = millis();
+  // while (!wifiReady) {
+  //   delay(50);
+  //   Serial.printf(".");
+  //   if (millis() - start > 15000) {
+  //     Serial.printf("\n# IP acquisition timed out\n");
+  //     return;
+  //   }
+  // }
 }
 
 // ── CSI service ───────────────────────────────────────────────────────────────
@@ -833,31 +1099,35 @@ static void drainPktRates(uint32_t now) {
     if (!gDevices[i].valid) continue;
     gDevices[i].pktRate = gDevices[i].pktCount;
     gDevices[i].pktCount = 0;
+
+    bool wasHidden = gDevices[i].hidden;
+
     if (gDevices[i].pktRate == 0) {
       gDevices[i].lowPpsSecs++;
-      if (gDevices[i].lowPpsSecs >= kHideAfterLowPpsSecs && !gDevices[i].hidden) {
+      if (gDevices[i].lowPpsSecs >= kHideAfterLowPpsSecs) {
         gDevices[i].hidden = true;
-        gDeviceListDirty = true;
       }
     } else {
-      if (gDevices[i].hidden && !gDevices[i].lowPpsSecs) {
-        gDevices[i].hidden = false;
-        gDeviceListDirty = true;
-      }
       gDevices[i].lowPpsSecs = 0;
+      if (gDevices[i].hidden && !gDevices[i].lowRssiSecs) {
+        gDevices[i].hidden = false;  // PPS recovered; RSSI must still be failing to keep hidden
+      }
     }
     if (gDevices[i].rssi <= -80) {
       gDevices[i].lowRssiSecs++;
-      if (gDevices[i].lowRssiSecs >= kHideAfterLowRssiSecs && !gDevices[i].hidden) {
+      if (gDevices[i].lowRssiSecs >= kHideAfterLowRssiSecs) {
         gDevices[i].hidden = true;
-        gDeviceListDirty = true;
       }
     } else {
-      if (gDevices[i].hidden && !gDevices[i].lowRssiSecs) {
-        gDevices[i].hidden = false;
-        gDeviceListDirty = true;
-      }
       gDevices[i].lowRssiSecs = 0;
+      if (gDevices[i].hidden && !gDevices[i].lowPpsSecs) {
+        gDevices[i].hidden = false;  // RSSI recovered; PPS must still be failing to keep hidden
+      }
+    }
+
+    // Only mark dirty on actual hidden-state transitions (not every call)
+    if (wasHidden != gDevices[i].hidden) {
+      gDeviceListDirty = true;
     }
 
     // Reveal: device must pass both thresholds for 10 s before showing
@@ -898,6 +1168,7 @@ static int drawDeviceList() {
       _sorted[n].channel = gDevices[i].channel;
       _sorted[n].lastSeen = gDevices[i].lastSeen;
       _sorted[n].pktRate = gDevices[i].pktRate;
+      _sorted[n].dopplerClass = gDevices[i].dopplerClass;
       _sorted[n].visible = true;
       _sorted[n].valid = true;
       n++;
@@ -950,11 +1221,16 @@ static int drawDeviceList() {
     for (int i = 0; i < BAR_W; i++) barStr[i] = (i < filled) ? '\xDB' : '\xB1';
     barStr[BAR_W] = '\0';
 
-    uint16_t barCol = (d->motion > gThreshold)
-      ? canvas.color565(0, 200, 220)
-      : canvas.color565(50, 50, 80);
-    canvas.setTextColor(barCol, TFT_BLACK);
-    canvas.drawString(barStr, 120, y + 3);
+    //canvas.setTextColor(barCol, TFT_BLACK);
+    //canvas.drawString(barStr, 120, y + 3);
+
+    // Doppler classification text (per-device)
+    const char* dopplerTxt = (d->dopplerClass == DopplerClass::HUMAN) ? "HUMAN" : "STATIC";
+    uint16_t dopplerCol = (d->dopplerClass == DopplerClass::HUMAN)
+      ? canvas.color565(0, 220, 80)
+      : canvas.color565(60, 60, 80);
+    canvas.setTextColor(dopplerCol, TFT_BLACK);
+    canvas.drawString(dopplerTxt, 120, y + 3);
 
     char statStr[16];
     snprintf(statStr, sizeof(statStr), "%4ddB %4dp/s", (int)d->rssi, (int)d->pktRate);
@@ -981,6 +1257,77 @@ static void drawRadar() {
   int deviceCount = 0;
   if (gVizMode == VizMode::DEVICE_LIST) {
     deviceCount = drawDeviceList();
+  } else if (gVizMode == VizMode::FFT_LINES) {
+    // ── FFT multi-line viz: top 240px × 240px, 11 lines × 21px (20px bar + 1px gap) ──
+    const int BAR_W = 6;
+    const int GAP = 1;
+    const int LINE_H = 20;
+    const int LINE_GAP = 1;
+    const int STEP = LINE_H + LINE_GAP;   // 21
+    const int NBARS = 32;
+    const int START_X = 1;
+    const int MAX_LINES = 240 / STEP;     // 11
+    const int BG_COL = canvas.color565(0, 0, 10);
+    const int BORDER_COL = canvas.color565(60, 0, 60);
+
+    // Collect up to MAX_LINES devices with FFT data, sorted by RSSI
+    const DeviceEntry* sorted[MAX_LINES];
+    int n = 0;
+    for (int i = 0; i < kMaxDevices && n < MAX_LINES; i++) {
+      if (!gDevices[i].valid || !gDevices[i].visible || gDevices[i].hidden) continue;
+      if (gDevices[i].dopplerFilled < kDopplerFrames || !gDevices[i].dopplerFft) continue;
+      // Insert by RSSI descending
+      int pos = n;
+      for (int j = 0; j < n; j++) {
+        if (gDevices[i].rssi > sorted[j]->rssi) { pos = j; break; }
+      }
+      for (int k = n; k > pos; k--) sorted[k] = sorted[k - 1];
+      sorted[pos] = &gDevices[i];
+      n++;
+    }
+
+    for (int line = 0; line < MAX_LINES; line++) {
+      int y = line * STEP;
+      canvas.fillRect(0, y, 240, LINE_H, BG_COL);
+
+      if (line < n && sorted[line]->dopplerFft) {
+        const DeviceEntry* d = sorted[line];
+
+        // Find peak magnitude for normalization (noise-subtracted if EMA mode)
+        float mag32[32] = {0};
+        float maxMag = 0.0f;
+        for (int j = 1; j < NBARS; j++) {
+          float re = d->dopplerFft[j * 2];
+          float im = d->dopplerFft[j * 2 + 1];
+          float mag = sqrtf(re * re + im * im);
+          if (gThreshold == 0.0f) {
+            mag = mag - d->dopplerNoiseFloor[j];  // EMA noise subtraction
+            if (mag < 0.0f) mag = 0.0f;
+          }
+          mag32[j] = mag;
+          if (mag > maxMag) maxMag = mag;
+        }
+        float scale = (maxMag > 0.0f) ? (float)LINE_H / maxMag : 0.0f;
+
+        for (int j = 1; j < NBARS; j++) {
+          int x = START_X + (j - 1) * (BAR_W + GAP);
+          float mag = mag32[j];
+          int barH = (int)(mag * scale);
+          if (barH > LINE_H) barH = LINE_H;
+          uint16_t col = canvas.color565(0, 160, 200);
+          if (j >= kDopplerHzBinLo && j <= kDopplerHzBinHi) col = canvas.color565(220, 0, 200);
+          if (mag > 0.0f && (int)j == d->dopplerPeakBin) col = canvas.color565(255, 255, 0);
+          canvas.fillRect(x, y + LINE_H - barH, BAR_W, barH, col);
+        }
+
+        char pktStr[4];
+        snprintf(pktStr, sizeof(pktStr), "%2d", (int)d->pktRate);
+        canvas.setTextColor(canvas.color565(100, 100, 120), BG_COL);
+        canvas.drawString(pktStr, 227, y + 6);
+      }
+      canvas.drawRect(0, y, 240, LINE_H, BORDER_COL);
+    }
+    deviceCount = n;
   } else {
     // Radar scope fills 230x230 box starting at (5,5) — R=115, cx=cy=120
     drawScope(canvas, 120, 120, 115, now, gCalibrating);
@@ -998,23 +1345,24 @@ static void drawRadar() {
   canvas.setTextColor(cCyan, cBar);
 
   int contacts = 0;
-  for (int i = 0; i < 12; i++) {
-    if (blips[i].active && (now - blips[i].birth) < BLIP_LIFE) contacts++;
+  if (gVizMode != VizMode::DEVICE_LIST && gVizMode != VizMode::FFT_LINES) {
+    for (int i = 0; i < 12; i++) {
+      if (blips[i].active && (now - blips[i].birth) < BLIP_LIFE) contacts++;
+    }
   }
 
-  char status[48];
-  if (gVizMode == VizMode::DEVICE_LIST) {
-    if (deviceCount <= 16) snprintf(status, sizeof(status), "Clients: %d", deviceCount);
-    else snprintf(status, sizeof(status), "Clients: 16+");
-  } else if (gCalibrating) {
+  int displayCount = (contacts > 0) ? contacts + 1 : deviceCount;
+
+  char status[64];
+  if (gCalibrating) {
     int remaining = (int)((kCalDurationMs - (now - gCalStartMs) + 999) / 1000);
-    snprintf(status, sizeof(status), "CAL %ds  step away!", remaining);
-  } else if (present) {
-    snprintf(status, sizeof(status), "T:%d%%  C:%d  M:%d%%  %ddBm",
-      (int)(gThreshold * 100), contacts + 1, (int)(s.motion * 100), s.rssi);
+    snprintf(status, sizeof(status), "CAL %ds step away!  %s", remaining, gIpStr);
+  } else if (gThreshold == 0.0f) {
+    snprintf(status, sizeof(status), "T:EMA C:%d M:%d%% %ddBm %s",
+      displayCount, (int)(s.motion * 100), s.rssi, gIpStr);
   } else {
-    snprintf(status, sizeof(status), "T:%d%%  scanning..  %ddBm",
-      (int)(gThreshold * 100), s.rssi);
+    snprintf(status, sizeof(status), "T:%2d%% C:%d M:%d%% %ddBm %s",
+      (int)(gThreshold * 100), displayCount, (int)(s.motion * 100), s.rssi, gIpStr);
   }
   canvas.drawString(status, (canvas.width() - canvas.textWidth(status)) / 2, 246);
 
@@ -1037,6 +1385,61 @@ static void drawRadar() {
     canvas.drawFastVLine(i * (canvas.width() / 4), 260, 40, cBorder);
   }
 
+  // ── FFT bar graph: 32 bins (DC skipped), y=300-320, 6px wide bars, 1px gap ──
+  // Hidden in FFT_LINES mode since the full multi-line FFT is already shown above
+  {
+    const int BAR_W = 6;
+    const int GAP = 1;
+    const int BAR_H = 20;
+    const int START_X = 8;
+    const int BAR_Y = 320 - BAR_H;  // 300
+    const int NBARS = 32;
+
+    if (gVizMode != VizMode::FFT_LINES) {
+      // Find top RSSI visible device that has FFT data
+      const DeviceEntry* top = nullptr;
+      for (int i = 0; i < kMaxDevices; i++) {
+        if (gDevices[i].valid && gDevices[i].visible && !gDevices[i].hidden && gDevices[i].dopplerFilled >= kDopplerFrames) {
+          if (!top || gDevices[i].rssi > top->rssi) top = &gDevices[i];
+        }
+      }
+
+      if (top && top->dopplerFft && gDopplerHandle) {
+        float mag32[32] = {0};
+        float maxMag = 0.0f;
+        for (int j = 1; j < kDopplerFFTSize / 2; j++) {
+          float re = top->dopplerFft[j * 2];
+          float im = top->dopplerFft[j * 2 + 1];
+          float mag = sqrtf(re * re + im * im);
+          if (gThreshold == 0.0f) {
+            mag = mag - top->dopplerNoiseFloor[j];  // EMA noise subtraction
+            if (mag < 0.0f) mag = 0.0f;
+          }
+          mag32[j] = mag;
+          if (mag > maxMag) maxMag = mag;
+        }
+        float scale = (maxMag > 0.0f) ? (float)BAR_H / maxMag : 0.0f;
+
+        for (int j = 1; j < NBARS; j++) {           // bins 1-31 (skip DC bin 0)
+          int x = START_X + (j - 1) * (BAR_W + GAP);
+          float mag = mag32[j];
+          int barH = (int)(mag * scale);
+          if (barH > BAR_H) barH = BAR_H;
+          uint16_t col = canvas.color565(0, 160, 200);
+          if (j >= kDopplerHzBinLo && j <= kDopplerHzBinHi) col = canvas.color565(220, 0, 200);  // human band
+          if (mag > 0.0f && (int)j == top->dopplerPeakBin) col = canvas.color565(255, 255, 0);  // peak bin
+          canvas.fillRect(x, BAR_Y + BAR_H - barH, BAR_W, barH, col);
+        }
+      } else {
+        canvas.fillRect(START_X, BAR_Y, NBARS * (BAR_W + GAP) - GAP, BAR_H, canvas.color565(0, 0, 10));
+      }
+      canvas.drawRect(START_X - 1, BAR_Y - 1, NBARS * (BAR_W + GAP) + 2, BAR_H + 2, canvas.color565(60, 0, 60));
+    } else {
+      // FFT_LINES mode: clear the strip to black
+      canvas.fillRect(0, BAR_Y, 240, BAR_H, TFT_BLACK);
+    }
+  }
+
   canvas.pushSprite(0, 0);
 }
 #endif // FREENOVE
@@ -1055,7 +1458,7 @@ static void serviceKeys() {
     else if (zone == 4) { saveSettings(); gMenuOpen = false; }
   } else {
     if (zone == 0) cycleVizMode();
-    else if (zone == 1) { gThreshold -= 0.05f; if (gThreshold < 0.05f) gThreshold = 0.05f; radar.setThreshold(gThreshold); } else if (zone == 2) { gThreshold += 0.05f; if (gThreshold > 0.95f) gThreshold = 0.95f; radar.setThreshold(gThreshold); } else if (zone == 3) startCalibration();
+    else if (zone == 1) { gThreshold -= 0.05f; if (gThreshold < 0.0f) gThreshold = 0.0f; radar.setThreshold(gThreshold); } else if (zone == 2) { gThreshold += 0.05f; if (gThreshold > 0.95f) gThreshold = 0.95f; radar.setThreshold(gThreshold); } else if (zone == 3) startCalibration();
     else if (zone == 4) { gMenuOpen = true; gMenuCursor = 0; }
   }
 }
@@ -1072,7 +1475,7 @@ static void serviceKeys() {
       else if (c == '`') { saveSettings(); gMenuOpen = false; }
     } else {
       if (c == '`') { gMenuOpen = true; gMenuCursor = 0; } else if (c == 'c' || c == 'C') radar.calibrate();
-      else if (c == ',') { gThreshold -= 0.05f; if (gThreshold < 0.05f) gThreshold = 0.05f; radar.setThreshold(gThreshold); } else if (c == '/') { gThreshold += 0.05f; if (gThreshold > 0.95f) gThreshold = 0.95f; radar.setThreshold(gThreshold); }
+      else if (c == ',') { gThreshold -= 0.05f; if (gThreshold < 0.0f) gThreshold = 0.0f; radar.setThreshold(gThreshold); } else if (c == '/') { gThreshold += 0.05f; if (gThreshold > 0.95f) gThreshold = 0.95f; radar.setThreshold(gThreshold); }
     }
   }
 }
@@ -1104,7 +1507,100 @@ void setup() {
   randomSeed(micros());
   loadSettings();
   applyBrightness();
-  initCsi();
+  // initCsi();
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    // NVS is corrupt or full. This is unrecoverable.
+    Serial.println("NVS partition corrupt! Erasing and restarting...");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_flash_erase());
+    esp_restart();
+  }
+  ESP_ERROR_CHECK_WITHOUT_ABORT(ret); // Check for other errors
+  Serial.println("NVS flash initialized.");
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_init());
+  
+  sta_netif = esp_netif_create_default_wifi_sta();
+  ap_netif = esp_netif_create_default_wifi_ap();
+  wifi_init_config_t wifi_initiation = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&wifi_initiation);
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_restore());
+  esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+  esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+
+  wifi_country_t country = {
+    .cc = "US",
+    .schan = 1,
+    .nchan = 14,
+    .max_tx_power = 20,
+    .policy = WIFI_COUNTRY_POLICY_MANUAL
+  };
+  esp_wifi_set_country(&country);
+
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  // ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
+
+  // // Wait for WiFi to be fully ready
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // // Stop any auto-connection attempt
+  // esp_wifi_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(100));
+  Serial.println("Checking WiFi Stuff");
+
+  // wifi_band_mode_t band_mode;
+  // esp_wifi_get_band_mode(&band_mode);
+  // Serial.printf("Band mode: %s\n", wifi_band_mode_to_string(band_mode));
+
+  // wifi_protocols_t protocols;
+  // esp_wifi_get_protocols(WIFI_IF_STA, &protocols);
+  // print_wifi_protocols("2.4GHz protocols before set:", protocols.ghz_2g);
+  // if (band_mode != WIFI_BAND_MODE_2G_ONLY) print_wifi_protocols("5GHz protocols before set:", protocols.ghz_5g);
+
+  wifi_country_t country_check;
+  esp_wifi_get_country(&country_check);
+  Serial.printf("Country: %.2s, channels %d-%d\n", country_check.cc, country_check.schan, country_check.schan + country_check.nchan - 1);
+
+  // wifi_protocols_t xprotocols;
+  // wifi_bandwidths_t bw_config;
+
+  // if (band_mode != WIFI_BAND_MODE_2G_ONLY) {
+  //   xprotocols = {
+  //     .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N,
+  //     .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N
+  //   };
+  //   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocols(WIFI_IF_STA, &xprotocols));
+  //   bw_config = {
+  //     .ghz_2g = WIFI_BW_HT40,
+  //     .ghz_5g = WIFI_BW_HT40,
+  //   };
+  //   esp_err_t err = esp_wifi_set_bandwidths(WIFI_IF_STA, &bw_config);
+  //   Serial.printf("Set bandwidths result: %d (%s)\n", err, esp_err_to_name(err));
+  // } else {
+  //   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+  //   esp_err_t err = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+  //   Serial.printf("Set bandwidth result: %d (%s)\n", err, esp_err_to_name(err));
+  // }
+
+  // esp_wifi_get_protocols(WIFI_IF_STA, &xprotocols);
+
+  // print_wifi_protocols("2.4GHz protocols after set:", xprotocols.ghz_2g);
+  // if (band_mode != WIFI_BAND_MODE_2G_ONLY) print_wifi_protocols("5GHz protocols after set:", xprotocols.ghz_5g);
+  // wifi_config_t sta_cfg = {};
+
+  wifi_config_t wifi_sta_config = {};
+  strncpy(reinterpret_cast<char*>(wifi_sta_config.sta.ssid), WIFI_SSID, sizeof(wifi_sta_config.sta.ssid));
+  strncpy(reinterpret_cast<char*>(wifi_sta_config.sta.password), WIFI_PASS, sizeof(wifi_sta_config.sta.password));
+  wifi_sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+  wifi_sta_config.sta.failure_retry_cnt = 5;
+  wifi_sta_config.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+
+  // ESP_ERROR_CHECK(esp_wifi_start());
+  // ESP_ERROR_CHECK(esp_wifi_connect());
+
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
+
 }
 
 void loop() {
@@ -1112,7 +1608,27 @@ void loop() {
   serviceKeys();
   serviceCsi();
   uint32_t now = millis();
+
+  // Poll for STA IP once connected — more reliable than events when Arduino core is involved
+  // if (gIpStr[0] == 'n') {
+  //   esp_netif_t* sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  //   if (sta_netif) {
+  //     esp_netif_ip_info_t ip_info;
+  //     if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+  //       snprintf(gIpStr, sizeof(gIpStr), "%d.%d.%d.%d", IP2STR(&ip_info.ip));
+  //       Serial.printf("# STA IP: %s\n", gIpStr);
+  //     }
+  //   }
+  // }
+
   drainPktRates(now);
+  // Run per-device Doppler FFT — sliding window, continuous as new samples arrive
+  for (int i = 0; i < kMaxDevices; i++) {
+    if (!gDevices[i].valid || !gDevices[i].dopplerBuf) continue;
+    if (gDevices[i].dopplerFilled >= kDopplerFrames) {
+      runDopplerFFTForDevice(i);  // runs every ~66 ms (every new sample once buffer is full)
+    }
+  }
   static uint32_t lastDraw = 0;
   if (now - lastDraw >= 125) {
     lastDraw = now;
